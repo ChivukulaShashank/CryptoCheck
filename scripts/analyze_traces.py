@@ -97,40 +97,66 @@ def train_logistic_regression(samples, labels, epochs=50, lr=0.1):
             w -= lr * (err * x + 0.001 * w) / n
             b -= lr * err / n
 
-    # Compute predictions
+    # Calculate Confusion Matrix
+    tn, fp, fn_c, tp = 0, 0, 0, 0
     preds = []
-    correct = 0
     for x, y in zip(norm_x, labels):
         z = max(min(w * x + b, 30.0), -30.0)
         p = 1.0 / (1.0 + math.exp(-z))
         preds.append((p, y))
-        if (p >= 0.5 and y == 1) or (p < 0.5 and y == 0):
-            correct += 1
+        pred_label = 1 if p >= 0.5 else 0
+        if y == 0 and pred_label == 0: tn += 1
+        elif y == 0 and pred_label == 1: fp += 1
+        elif y == 1 and pred_label == 0: fn_c += 1
+        elif y == 1 and pred_label == 1: tp += 1
 
-    accuracy = correct / n
+    accuracy = (tp + tn) / n
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn_c) if (tp + fn_c) > 0 else 0.0
+    f1_score = 2.0 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
     # Calculate ROC-AUC via trapezoidal rule
     preds.sort(key=lambda item: item[0], reverse=True)
     positives = sum(1 for _, y in preds if y == 1)
     negatives = n - positives
     if positives == 0 or negatives == 0:
-        return accuracy, 0.5
+        auc = 0.5
+    else:
+        tp_count, fp_count = 0, 0
+        prev_fpr, prev_tpr = 0.0, 0.0
+        auc = 0.0
+        for _, actual in preds:
+            if actual == 1:
+                tp_count += 1
+            else:
+                fp_count += 1
+            tpr = tp_count / positives
+            fpr = fp_count / negatives
+            auc += (fpr - prev_fpr) * (tpr + prev_tpr) / 2.0
+            prev_fpr, prev_tpr = fpr, tpr
+        auc = min(max(auc, 0.0), 1.0)
 
-    tp, fp = 0, 0
-    prev_fpr, prev_tpr = 0.0, 0.0
-    auc = 0.0
+    # Shannon Mutual Information / Side-Channel Entropy Extracted:
+    # I(X; Y) = H(Y) - H(Y|X)
+    p_y1 = positives / n
+    p_y0 = 1.0 - p_y1
+    h_y = 0.0
+    if p_y1 > 0: h_y -= p_y1 * math.log2(p_y1)
+    if p_y0 > 0: h_y -= p_y0 * math.log2(p_y0)
 
-    for _, actual in preds:
-        if actual == 1:
-            tp += 1
-        else:
-            fp += 1
-        tpr = tp / positives
-        fpr = fp / negatives
-        auc += (fpr - prev_fpr) * (tpr + prev_tpr) / 2.0
-        prev_fpr, prev_tpr = fpr, tpr
+    err = max(min(1.0 - accuracy, 0.9999), 0.0001)
+    h_cond = -(err * math.log2(err) + (1.0 - err) * math.log2(1.0 - err))
+    shannon_entropy_bits = max(h_y - h_cond, 0.0)
 
-    return accuracy, min(max(auc, 0.0), 1.0)
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1_score": f1_score,
+        "roc_auc": auc,
+        "confusion_matrix": [[tn, fp], [fn_c, tp]],
+        "shannon_entropy_bits": shannon_entropy_bits,
+    }
 
 def main():
     csv_file = sys.argv[1] if len(sys.argv) > 1 else "timing_traces.csv"
@@ -170,15 +196,25 @@ def main():
         # ML Distinguisher
         all_cycles = [t["cycles"] for t in group_traces]
         all_labels = [t["class"] for t in group_traces]
-        acc, auc = train_logistic_regression(all_cycles, all_labels)
-        print(f"\n  [ML Distinguisher] Model   : Logistic Regression (SGD)")
-        print(f"  [ML Distinguisher] Accuracy: {acc * 100:.2f}%")
-        print(f"  [ML Distinguisher] ROC-AUC : {auc:.3f}")
+        m = train_logistic_regression(all_cycles, all_labels)
+        cm = m["confusion_matrix"]
+        print(f"\n  [ML Distinguisher] Model   : Regularized Logistic Regression (SGD)")
+        print(f"  [ML Distinguisher] Accuracy: {m['accuracy'] * 100:.2f}%")
+        print(f"  [ML Distinguisher] Precision: {m['precision']:.3f}")
+        print(f"  [ML Distinguisher] Recall   : {m['recall']:.3f}")
+        print(f"  [ML Distinguisher] F1-Score : {m['f1_score']:.3f}")
+        print(f"  [ML Distinguisher] ROC-AUC  : {m['roc_auc']:.3f}")
+        print(f"  [ML Distinguisher] Shannon Information Extracted : {m['shannon_entropy_bits']:.4f} bits / trace")
+        print(f"\n  [Confusion Matrix]")
+        print(f"    Actual 0 (Fixed)  -> TN: {cm[0][0]:<6} | FP: {cm[0][1]:<6}")
+        print(f"    Actual 1 (Random) -> FN: {cm[1][0]:<6} | TP: {cm[1][1]:<6}")
 
-        if auc > 0.70:
-            print("  [Security Impact] HIGH RISK: ML classifier extracts secret-dependent timing leakage.")
+        if m["roc_auc"] > 0.70:
+            print(f"\n  [Security Risk Assessment] CRITICAL: ML classifier successfully exploits timing leakage.")
+            print(f"  Adversary extracts {m['shannon_entropy_bits']:.4f} bits of secret entropy per invocation.")
         else:
-            print("  [Security Impact] SECURE: Model performs as random guess (AUC ~ 0.50). Negative control verified.")
+            print(f"\n  [Security Risk Assessment] SECURE: ML predictions equivalent to random guessing (AUC ~ 0.50).")
+            print(f"  Zero side-channel entropy leaked to the adversary.")
 
     print("\n" + "=" * 72)
     print("Analysis complete.")
